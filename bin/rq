@@ -1,0 +1,327 @@
+#!/usr/bin/env ruby
+
+## SYNOPSIS
+##
+## Fast cmdline client for extracting resque/sidekiq worker info from redis,
+## displaying info with optional filters for age and class, and optionally
+## running shell commands on each worker (with hostname and port passed).
+## Call as 'rq' for resque, or 'sq' for sidekiq (or use --prefix).
+##
+## USAGE
+##
+##   rq [options] command [-e shell_command]
+##
+## where command is one of: queues workers failed running pending stats. Commands
+## may be be shortened to their shortest unique beginning.
+##
+## See option list using -h.
+##
+## EXAMPLE
+##
+## Show ps listing for all running jobs older than 1 hour:
+##
+##   rq running -o 1h -e ssh {host} ps -lfp {pid}
+##
+## CONFIG
+##
+## Configure your environments and redis servers in ~/.rq.yml. For example:
+##
+##   environments:
+##     production:  redis-01:6379
+##     staging:     redis-stg-01:6379
+##     development: localhost:6379
+##   environment: production
+##
+## LICENSE
+##
+## See included file LICENSE.
+##
+## COPYRIGHT
+##
+## Copyright (c) 2012 Richard Lister.
+
+require "redis"
+require "json"
+require "optparse"
+require 'date'
+require 'yaml'
+
+class Object
+  def try(method)
+    send method if respond_to? method
+  end
+end
+
+## convert array of arrays to array of strings with columns aligned
+class Array
+  def values
+    self
+  end
+
+  def tabulate
+    widths = self.map do |row|
+      row.values.map { |value| value.to_s.length }
+    end.transpose.map(&:max) # => array of columns widths
+
+    self.map do |row|
+      row.values.each_with_index.map do |cell, index|
+        "%-#{widths[index]}s" % cell
+      end.join('  ')
+    end # => array of formatted table rows as strings
+  end
+end
+
+## return new hash with all keys recursively turned into symbols
+class Hash
+  def symbolize_keys
+    Hash[self.map do |key, value|
+      [ key.to_sym, value.respond_to?(:symbolize_keys) ? value.symbolize_keys : value ]
+    end]
+  end
+end
+
+## human-readable time in past relative to present
+class String
+  def seconds_ago
+    DateTime.parse(self).to_time.seconds_ago
+  end
+
+  def to_seconds
+    multiplier = { '' => 1, 's' => 1, 'm' => 60, 'h' => 3600, 'd' => 86400, 'w' => 604800 }
+    /^(\d+)\s*([smhdw]?)/.match(self) or raise ArgumentError, "Illegal time period #{self}"
+    Integer($1) * multiplier[$2]
+  end
+end
+
+## assume sidekiq timestamps given as int are epochs
+class Fixnum
+  def seconds_ago
+    Time.at(self).to_time.seconds_ago
+  end
+end
+
+class Time
+  def seconds_ago
+    Time.now.utc.to_i - self.utc.to_i
+  end
+end
+
+## convert time in secs to human-readable units
+class Fixnum
+  def to_dhms
+    m, s = self.divmod(60)
+    h, m = m.divmod(60)
+    d, h = h.divmod(24)
+    {:d => d, :h => h, :m => m, :s => s}.map do |k,v|
+      v>0 ? "#{v}#{k}" : nil
+    end.compact.join(" ")
+  end
+end
+
+class ResqueCmdline
+  attr_reader :redis, :options, :prefix
+  
+  def initialize(options = nil)
+    @options = options
+    host, port = options[:redis].split(':')
+    @redis = Redis.new(:host => host, :port => port || 6379)
+    @prefix = options[:prefix]
+  end
+
+  def queues
+    redis.smembers("#{prefix}queues").sort.map { |q| [q] }
+  end
+
+  def workers
+    redis.smembers("#{prefix}workers").sort.map { |w| [w] }
+  end
+
+  def failed
+    failed = redis.lrange("#{prefix}failed", 0, -1).map do |f|
+      job = JSON(f)
+      {
+        :worker    => job['worker'].match(/^([\w\.-]+:\d+):/).captures.join,
+        :queue     => job['queue'],
+        :class     => job['payload']['class'],
+        :exception => job['exception'],
+        :date      => job['failed_at'].seconds_ago,
+        :retried   => job['retried_at'].try(:seconds_ago), # can be nil
+      }
+    end
+
+    if options[:older]
+      failed.select! { |job| job[:date] >= options[:older] }
+    end
+
+    if options[:retried]
+      failed.select! { |job| job[:retried] and job[:retried] >= options[:retried] }
+    end
+
+    failed.sort{ |a,b| b[:date] <=> a[:date] }.each do |job|
+      job[:date]    = job[:date].to_dhms
+      job[:retried] = job[:retried].try(:to_dhms) # can be nil
+    end
+  end
+
+  def unregister(hostport)
+    redis.smembers("#{prefix}workers").grep(/^#{hostport}/).each do |worker|
+      puts "unregistering: #{worker}"
+      redis.srem("#{prefix}workers", worker)
+      redis.del("#{prefix}worker:#{worker}")
+      redis.del("#{prefix}worker:#{worker}:started")
+      redis.del("#{prefix}stat:processed:#{worker}")
+      redis.del("#{prefix}stat:failed:#{worker}")
+    end
+  end
+
+  def running
+    keys = redis.smembers("#{prefix}workers").map { |worker| "#{prefix}worker:#{worker}" }
+    return keys if keys.empty?
+
+    running = redis.mapped_mget(*keys).map do |key, value|
+      if value.nil? || value.empty?
+        nil
+      else
+        job = JSON(value)
+        {
+          :worker => key.match(/^#{prefix}worker:([\w\.-]+:[\d\-]+):/).captures.join,
+          :queue  => job['queue'],
+          :class  => job['payload']['class'],
+          :date   => job['run_at'].seconds_ago,
+        }
+      end
+    end.compact
+
+    if options[:older]
+      running.select! { |job| job[:date] >= options[:older] }
+    end
+
+    running.sort { |a,b| b[:date] <=> a[:date] }.each do |job|
+      job[:date] = job[:date].to_dhms
+    end
+  end
+
+  def pending
+    redis.smembers("#{prefix}queues").map do |queue|
+      {
+        :name  => queue,
+        :count => redis.llen("#{prefix}queue:#{queue}")
+      }
+    end.sort { |a,b| b[:count] <=> a[:count] }
+  end
+
+  def stats
+    [
+     [ "total processed", redis.get("#{prefix}stat:processed").to_s ],
+     [ "total failed", redis.get("#{prefix}stat:failed").to_s ],
+     [ "queues", queues.size.to_s ],
+     [ "workers", redis.scard("#{prefix}workers").to_s ],
+     [ "pending", queues.inject(0) { |sum, q| sum + redis.llen("#{prefix}queue:#{q}") }.to_s ],
+     [ "failed", redis.llen("#{prefix}failed").to_s ],
+    ]
+  end
+
+end
+
+## defaults
+options = {
+  :environments => {
+    :production  => 'http://redis:6379',
+    :development => 'http://localhost:6379'
+  },
+  :environment => :production,
+  #:prefix      => 'resque:',
+  :prefix      => File.basename($0) == 'sq' ? '' : 'resque:', #sidekiq vs resque
+}
+
+## merge options from config file
+cfgfile = File.join(ENV['HOME'], '.rq.yml')
+options = options.merge(YAML.load_file(cfgfile).symbolize_keys) if File.exists?(cfgfile)
+
+commands = %w[queues workers failed running pending stats]
+
+OptionParser.new do |opt|
+  opt.banner = "Usage: #{$0} [options] command [-e shellcmd]\n(use -h for help)."
+  opt.on('-c', '--class REGEX', 'Filter by class name.') do |c|
+    options[:class] = c
+  end
+  opt.on('-e', '--exec CMD', 'Exec cmd with sub for {host} and {pid}, must be last arg.') do |e|
+    options[:exec] = ARGV.shift(ARGV.length).unshift(e).join(' ') # slurp rest of ARGV
+  end
+  opt.on('-E', '--environment REGEX', 'Environment to use.') do |e|
+    options[:environment] = e
+  end
+  opt.on('-j', '--json', 'Dump output as JSON instead of tabulated output.') do |j|
+    options[:json] = j
+  end
+  opt.on('-o', '--older TIME', 'Filter date e.g. 30s, 2d.') do |o|
+    options[:older] = o.to_seconds
+  end
+  opt.on('-p', '--prefix PREFIX', 'Prefix for keys in redis.') do |p|
+    options[:prefix] = p
+  end
+  opt.on('-q', '--queue REGEX', 'Filter by queue name.') do |q|
+    options[:queue] = q
+  end
+  opt.on('-r', '--retried TIME', 'Filter failed jobs retried before time.') do |r|
+    options[:retried] = r.to_seconds
+  end
+  opt.on('-R', '--redis SERVER' 'Set redis server as host:port') do |r|
+    options[:redis] = r
+  end
+  opt.on('-U', '--unregister', 'Unregister matching workers from redis. Be very careful.') do |u|
+    options[:unregister] = u
+  end
+  opt.on_tail("-h", "--help", "Show this message.") do
+    puts opt
+    puts "     cmd: #{commands.join(' ')}"
+    exit
+  end
+end.parse!
+
+
+## find command that matches arg given
+matching = commands.grep /^#{ARGV.first}/
+abort "commands: #{commands.join(' ')}" unless matching.length == 1
+
+## find first matching environment
+environment, redis = options[:environments].find do |k, v|
+  k.match(/^#{options[:environment]}/)
+end
+abort "environments: #{options[:environments].keys.join(' ')}" unless environment && redis
+
+## redis server from environment, unless overridden with option
+options[:redis] ||= redis
+
+## get data from redis
+cmd = ResqueCmdline.new(options)
+output = cmd.send(matching.first)
+
+## grep output by a specific named column
+[:class, :queue].each do |field|
+  if options[field]
+    output.select! do |row|
+      c = row.fetch(field) { nil } and c.match(options[field])
+    end
+  end
+end
+
+## handle data for exec or output
+if options[:exec]
+  output.each do |line|
+    worker = line.fetch(:worker) { false } or next
+    host, pid = worker.split(':')
+    cmd = options[:exec].dup
+    cmd.gsub!(/\{host\}/, host).gsub!(/\{pid\}/, pid)
+    system cmd
+  end
+elsif options[:unregister]
+  output.each do |line|
+    worker = line.fetch(:worker) { false } or next
+    cmd.unregister(worker)
+  end
+elsif options[:json]
+  puts JSON.dump(output)
+else
+  puts output.tabulate
+end
